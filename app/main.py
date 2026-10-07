@@ -217,7 +217,7 @@ def create_app(db_path=DEFAULT_DB):
 
     @app.post("/events/{event_id}/registrations", status_code=201, tags=["Registrations"])
     def register(event_id: int, user: User):
-        # Most important part of the project: lock -> check -> insert -> commit.
+        # Hold the write lock while checking capacity and reserving a seat.
         with connect(db_path, write=True) as db:
             event = get_event(db, event_id)
             if datetime.fromisoformat(event["starts_at"]) <= datetime.now(timezone.utc):

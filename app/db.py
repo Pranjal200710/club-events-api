@@ -15,7 +15,7 @@ def connect(path, *, write=False):
     db.execute("PRAGMA foreign_keys = ON")
     try:
         if write:
-            # Acquire the database write lock BEFORE reading capacity or tokens.
+            # Take the write lock before reading the seat count or tokens.
             db.execute("BEGIN IMMEDIATE")
         yield db
         if write:
