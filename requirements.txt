@@ -1,4 +1,4 @@
-# Exact versions used for the verified build (Python 3.12).
+# Versions used for this project (Python 3.12).
 fastapi==0.142.2
 uvicorn==0.54.0
 httpx==0.28.1

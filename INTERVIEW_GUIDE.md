@@ -1,22 +1,20 @@
-# Understand your Club Events API
+# My project notes
 
-Read this with the code open. The goal is to be able to trace one request and explain why each check exists. You do not need to memorize library internals.
+These are my notes on how the Club Events API works, why I used this approach, and the parts I need to be able to explain in the interview.
 
-## 1. What did you build?
+## 1. The idea
 
-Say it in your own words:
+I made an API for a club's events. Admins create events, and members book or cancel seats. The two main things I wanted to get right were role restrictions and preventing overbooking when requests arrive together.
 
-> I built an API for a club's events. Admins create events, and members reserve or cancel seats. Users and events are connected through a registrations table. Login gives short-lived access tokens and refresh tokens. The important part is that registration uses a database transaction, so two requests cannot overbook the last seat.
+An API lets a client send requests to the backend and get responses. In this project, I can use the `/docs` page as the client. The data sent and received is mostly JSON.
 
-An **API** is a set of rules for sending requests to a program and getting responses. Your browser, a mobile app, or a tool such as Postman can be the client. The **backend** processes those requests. JSON is the text format we use to exchange data.
+FastAPI connects each route to a Python function. Uvicorn runs the server, and SQLite saves the data in a file.
 
-FastAPI matches each request to a Python function. Uvicorn is the server that accepts the network connection. SQLite stores data in a file that survives a restart.
+For example, `POST /events/3/registrations` means reserving a seat at event 3 for the logged-in user. `GET` reads data, `POST` creates something or performs an action, and `DELETE` removes something.
 
-Example: `POST /events/3/registrations` means "reserve a seat for the logged-in user at event number 3." `POST` creates something; `GET` reads something; `DELETE` removes something.
+## 2. The tables — app/schema.sql
 
-## 2. Understand the tables first — app/schema.sql
-
-Imagine these records:
+I kept users, events and registrations in separate tables.
 
 ```text
 users                 events                 registrations
@@ -26,198 +24,238 @@ id  username role     id title capacity      user_id event_id
 3   bob      member                          3       10
 ```
 
-Alice is in two events. The Python event has two users. This is a **many-to-many relationship**: one user can join many events, and one event can have many users.
+In this example, Alice has joined two events, and the Python event has two members. That is a many-to-many relationship.
 
-The registrations table is a **join table**. Each row connects one user ID and one event ID. It avoids copying usernames or event titles into every registration.
+The `registrations` table joins users and events. Each row contains one user ID and one event ID. I do not need to copy the username and event details into every booking.
 
-A **primary key** uniquely identifies a record. The registrations table has a combined primary key `(user_id, event_id)`, so `(2, 10)` cannot appear twice. A **foreign key** requires the referenced user/event to exist. `PRAGMA foreign_keys = ON` enables enforcement on every SQLite connection.
+A primary key identifies a record. Here, `(user_id, event_id)` is a combined primary key, so the same pair cannot be inserted twice. A foreign key makes sure the referenced user or event exists. I enable SQLite's foreign-key checks on every connection.
 
-`events.created_by` also references a real user. SQL's role `CHECK` allows only `admin` and `member`. Python validation rejects bad inputs before SQL, and database constraints protect the stored data as a second layer.
+The `created_by` field in events also points to a real user. The role has a database check allowing only `admin` and `member`.
 
-The fourth table, `sessions`, stores login sessions. It is part of authentication, not a substitute for the relationship between users and events.
+I use a fourth table, `sessions`, for login tokens and their expiry times.
 
-## 3. Understand connections and transactions — app/db.py
+## 3. Connections and transactions — app/db.py
 
-`connect()` opens a connection, lets the caller use it, then closes it. `@contextmanager` makes it usable with Python's `with` statement. `yield db` hands the connection to the code inside that block. After the block finishes, execution resumes after `yield`.
+I put the connection handling in `connect()` so the routes can share it.
 
 ```python
 with connect(db_path, write=True) as db:
-    # Use db here. The transaction has already started.
+    # The write transaction has started before this block runs.
     ...
-# The transaction committed, and the connection closed.
+# Commit on success; roll back if an exception occurs.
 ```
 
-A **transaction** groups work into one unit. **Commit** makes it permanent. **Rollback** cancels changes if an exception occurs. `try / except / finally` means: attempt the work, handle a failure, and always clean up.
+`@contextmanager` allows the function to work with a `with` block. `yield db` passes the connection into the block. Once the block finishes, execution continues after `yield`.
 
-`BEGIN IMMEDIATE` is the critical line. SQLite acquires its write lock before our code reads a seat count. Other writers wait (up to five seconds in our configuration). Read operations can continue using WAL mode. The lock is database-wide, not a row lock.
+A transaction groups operations together. Commit saves the changes; rollback undoes them if something fails. The `finally` block closes the connection either way.
 
-Every request can use a different connection. The database coordinates them. A normal Python `if` statement by itself would not coordinate two requests.
+For writes, I use `BEGIN IMMEDIATE`. It takes SQLite's write lock before reading data that is about to be changed. Other writers wait, up to the five-second timeout in this project. WAL mode allows readers to continue while a writer is working.
+
+The lock applies to the database, not just one row. Each request can have a separate connection, and SQLite handles the coordination.
 
 ## 4. Signup and passwords — app/main.py and app/auth.py
 
-Follow `signup()`:
+The signup flow is:
 
-1. FastAPI reads the request's JSON into the `Credentials` model.
-2. Pydantic checks username/password length, permitted username characters, and unexpected fields. A bad body returns 422.
-3. The username is normalized to lowercase.
-4. `hash_password()` generates a random salt and uses scrypt to derive a password hash.
-5. SQL inserts a user with the literal role `'member'`.
-6. The response returns the ID, username and role. It never returns the password hash.
+1. FastAPI reads the JSON into the `Credentials` model.
+2. Pydantic checks the username, password length and any unexpected fields.
+3. The username is converted to lowercase.
+4. The password is hashed with a random salt.
+5. A user row is inserted with the role fixed to `member`.
+6. The response contains the ID, username and role.
 
-**Why not store passwords directly?** If someone reads the database, plain passwords would immediately be exposed. A slow password hash makes guessing more expensive. The random salt means two people with the same password have different stored values.
+Invalid input gives a 422 response. A username that is already taken gives 409.
 
-Hashing is one-way. Encryption is reversible with a key. We verify a password by running the same hashing function with the stored salt and comparing the result. `hmac.compare_digest()` is designed for constant-time comparisons.
+I used `hashlib.scrypt` for passwords. It is a slow password-hashing function, which makes guessing passwords more expensive if the database is exposed. The salt makes the stored values different even when two users choose the same password.
 
-You do not need to derive the scrypt algorithm in an interview. Know its purpose and that the standard library handles its implementation.
+Hashing is one-way. To verify a password, the code hashes the entered password with the stored salt and compares the result using `hmac.compare_digest()`. It does not decrypt the stored hash.
 
-**Why can't I sign up as an admin?** The input model rejects extra fields such as `role`, and the SQL fixes new users to `member`. Admins are created through a trusted local command with server access. That command is not a public API endpoint.
+Public signup cannot create an admin. Extra fields such as `"role": "admin"` are rejected, and the SQL insert explicitly sets the role to `member`. I kept admin creation in a local command that requires access to the project on the server.
 
-## 5. Login, access tokens, refresh tokens and logout
+## 5. Login and tokens
 
-Follow `login()`:
+The login route finds the user and verifies the password. It then creates two random strings using `secrets.token_urlsafe(32)`:
 
-1. Find the username in the database.
-2. Verify the supplied password against the stored hash.
-3. Generate two unpredictable random strings using `secrets.token_urlsafe(32)`.
-4. Store only their SHA-256 hashes and expiry times in `sessions`.
-5. Return the raw strings once to the client.
+- An access token, normally valid for 15 minutes.
+- A refresh token, tied to a session with a seven-day lifetime.
 
-An **access token** is a temporary pass. The client sends it with each protected request:
+Only the SHA-256 hashes of these tokens are stored. The actual tokens are returned to the client.
+
+A protected request sends the access token in this header:
 
 ```text
 Authorization: Bearer <access_token>
 ```
 
-It normally lasts 15 minutes. A **refresh token** can get a new token pair for the same session without asking for the password again. The session has a maximum seven-day lifetime.
+I used opaque tokens, meaning random strings whose details are stored in the database. JWTs work differently: they contain signed claims. With my approach, the server looks up the token hash and checks its expiry on each request.
 
-These are **opaque tokens**: random strings whose meaning lives in the database. They are not JWTs. JWTs contain signed claims; our server instead looks up a token hash. Both formats can support expiring access tokens. Our choice makes revocation easy, at the cost of a database lookup on each protected request.
+That adds a database lookup, but it makes it straightforward to invalidate tokens by deleting the session.
 
-Follow `refresh()`:
+### Refresh
 
-1. Begin a write transaction.
-2. Find the refresh token's hash and check that it has not expired.
-3. Delete the old session row.
-4. Insert a new token pair, keeping the original session expiry.
+The refresh route runs these steps inside one write transaction:
+
+1. Find the refresh token's hash and check its expiry.
+2. Delete the old session.
+3. Insert a new token pair.
+4. Keep the original session's seven-day expiry.
 5. Commit and return the new tokens.
 
-This is **refresh token rotation**. After refresh, both old tokens are invalid. Two simultaneous refresh attempts cannot both succeed, because reading and replacing the token are inside one locked transaction. Reusing an old token returns 401.
+This is token rotation. Both old tokens stop working after refresh. Two requests trying to refresh with the same token cannot both succeed because the database lock covers the whole operation.
 
-`logout()` deletes the session identified by the refresh token. Both its access and refresh token stop working for subsequent checks. It works even when the access token has expired. Other independently logged-in sessions are unaffected.
+I do not reset the seven-day lifetime on every refresh. Otherwise, repeated refreshing could keep a session alive indefinitely.
 
-**Why SHA-256 for tokens but scrypt for passwords?** Tokens are already very long, random secrets. Passwords are human-chosen and guessable, so they need an intentionally expensive hash.
+### Logout
 
-## 6. Authentication versus authorization
+Logout accepts the current refresh token and deletes its session. Both tokens from that session then stop working. It still works if the access token has already expired. Other login sessions are unaffected.
 
-**Authentication** asks "Who are you?" `current_user()` reads the bearer token, hashes it, checks its expiry and loads the user.
+### Why two different hash functions?
 
-**Authorization** asks "Are you allowed to do this?" `admin_only()` checks the user's role. A member has a valid login but still cannot create an event.
+Passwords can be short or predictable, so I use slow scrypt hashing. Tokens are long random values, so SHA-256 is suitable for looking them up without storing the raw secrets.
 
-`Depends(current_user)` tells FastAPI to run that function before the route. `Admin` includes a further `admin_only` check. This shares the checks across routes so we do not copy them into every function.
+## 6. Authentication and authorization
 
-Remember the difference:
+I think of these as two separate checks:
 
-- **401**: no valid login token.
-- **403**: logged in, but wrong role.
-- **404**: requested event or own registration does not exist.
-- **409**: request conflicts with current state, such as a full event.
-- **422**: invalid input, such as zero capacity.
-- **503**: database stayed busy longer than the configured timeout; retry later.
+- Authentication: identify the user.
+- Authorization: check whether that user is allowed to perform the action.
 
-The role is read from the database, not trusted from a request body. Cancellation uses the authenticated user ID, so Alice cannot choose Bob's ID and cancel his seat.
+`current_user()` checks the access token and loads the user. `admin_only()` then checks whether their role is `admin`.
 
-## 7. Creating and listing events
+FastAPI's `Depends()` runs these checks before the route. The `User` and `Admin` aliases let me reuse the checks across endpoints.
 
-`EventInput` validates the title, capacity, and timezone-aware start date. The event must start in the future. We convert times to UTC before storing them so ordering and comparisons are consistent.
+The role comes from the database, not from a request body. For registration and cancellation, the user ID also comes from the session. Alice cannot enter Bob's ID to cancel his booking.
 
-`create_event()` requires an admin and inserts the event. `get_event()` joins registrations and counts them. `seats_left = capacity - registered_count`. We calculate the count instead of maintaining a second counter that might go out of sync.
+The response codes I use are:
 
-`list_events()` accepts page, page size, search, and sort values:
+| Code | Meaning here |
+| --- | --- |
+| 201 | A user, event or registration was created |
+| 204 | Cancellation or logout completed with no response body |
+| 401 | Missing, invalid or expired login token |
+| 403 | Valid login, but the role is not allowed |
+| 404 | The event or the user's registration does not exist |
+| 409 | A conflict, such as a full event or duplicate booking |
+| 422 | Invalid input |
+| 503 | The database stayed busy beyond the timeout |
+
+## 7. Events, search and pagination
+
+`EventInput` checks the event title, capacity and start date. Capacity must be a positive integer, and the date must be in the future with a timezone. I convert dates to UTC before storing them.
+
+Only an admin can call `create_event()`. To show an event's remaining seats, I count its registrations:
+
+```text
+seats_left = capacity - registered_count
+```
+
+I calculate this count instead of saving another counter that would need to be updated after every booking and cancellation.
+
+The event list accepts query parameters:
 
 ```text
 GET /events?page=2&page_size=10&search=Python&sort=date_asc
 ```
 
-**Pagination** splits results into pages. `LIMIT 10` returns at most 10 rows. `OFFSET (page - 1) * page_size` skips earlier rows: page 2 skips 10.
-
-Search uses a parameterized `LIKE` query. Sort values are selected from a fixed dictionary of safe SQL fragments. Never put arbitrary user-provided text directly into SQL. SQL placeholders (`?`) keep user data separate from the query's instructions.
-
-The response includes `total` as well as the current page. A read transaction keeps both queries on the same snapshot if an event is created between them.
-
-## 8. The most important explanation: no overbooking
-
-Without a lock, this can happen:
+`LIMIT` controls how many rows are returned. `OFFSET` skips earlier rows:
 
 ```text
-One seat left.
-Alice reads: 1 seat left.
-Bob reads:   1 seat left.
-Alice inserts a registration.
-Bob inserts a registration.
-Two registrations were made for one seat.
+offset = (page - 1) * page_size
+page 2 with 10 items per page -> skip the first 10
 ```
 
-That is a **race condition**. The result depends on how operations overlap in time.
+Search uses a parameterized `LIKE` query. The `?` placeholders keep supplied values separate from SQL instructions. For sorting, I only allow three predefined options, so arbitrary text cannot become part of `ORDER BY`.
 
-Follow `register()` in our implementation:
+I use a read transaction for the total count and the page query. This keeps the two results consistent if another request creates an event in between.
 
-1. Authenticate the user.
-2. Enter `connect(..., write=True)`, which acquires SQLite's write lock.
+## 8. The last-seat problem
+
+Without a lock, two requests could do this:
+
+```text
+There is one seat left.
+Alice checks: one seat available.
+Bob checks: one seat available.
+Alice inserts a registration.
+Bob inserts a registration.
+The event is now overbooked.
+```
+
+This is a race condition: the outcome depends on how operations overlap.
+
+In `register()`, I do the following:
+
+1. Check the user's access token.
+2. Start a write transaction and acquire the database lock.
 3. Check that the event exists and has not started.
-4. Check that this user is not already registered.
-5. Count registrations and check capacity, while still holding the lock.
-6. Insert a registration, then commit and release the lock.
+4. Check whether the user is already registered.
+5. Count the registrations and compare the count with capacity.
+6. Insert the registration, then commit.
 
-While Alice is doing steps 3–6, Bob cannot start another write transaction. When Alice commits, Bob proceeds and sees the updated count. He receives 409, event full.
+Bob's write transaction waits while Alice holds the lock. Once Alice commits, Bob reads the updated count and gets a 409 response if the event is full.
 
-**Is the `if` statement safe here?** Yes, because it runs inside a database transaction that already holds the write lock. It would be unsafe if we read the count first and only started the transaction afterwards.
+The `if` check is safe because the lock is already held when the count is read. Starting a transaction only after reading the count would be too late.
 
-**Why not use `threading.Lock`?** A Python lock only protects the code sharing that lock in one process. SQLite's file locks coordinate separate database connections, including separate server processes on the same machine.
+I used a database lock rather than a Python `threading.Lock`, since a Python lock would only coordinate callers sharing that lock in one process. SQLite's file locking also works between processes using the same local database file.
 
-**Would you use this at huge scale?** SQLite serializes all writes. A larger service could use PostgreSQL and lock the target event row with `SELECT ... FOR UPDATE` inside a transaction. We chose SQLite to keep local setup simple.
+SQLite still allows only one writer at a time across the database. If the app needed to handle many writes to different events, I would consider PostgreSQL with a lock on the specific event row.
 
-## 9. Understand the five tests — tests/test_api.py
+## 9. The five tests — tests/test_api.py
 
-An integration test checks multiple pieces together. These tests send requests through FastAPI and use real temporary SQLite database files. They do not just check for HTTP 200.
+I used integration tests so the routes, authentication and database are checked together.
 
-`@pytest.fixture` prepares a fresh app, database, test client and admin for each test. `tmp_path` is a temporary directory supplied by pytest. `assert` expresses the result that must be true.
+The pytest fixture creates a temporary database, starts a test app and seeds an admin account. Each test gets its own database, separate from `data/club.db`.
 
-The last-seat test creates eight users and one event with capacity one. `ThreadPoolExecutor` runs eight callers. `threading.Barrier` makes them wait until all are ready before releasing their registration requests together. Each caller uses a separate HTTP test client; routes open separate database connections.
+The tests cover:
 
-The test checks both responses and stored state: one success, seven full-event responses, and exactly one registration row. The refresh test similarly races two attempts using the same refresh token and expects one winner.
+1. Roles, password hashing and validation.
+2. Token expiry, rotation, logout and simultaneous refresh requests.
+3. Relationships, duplicates, cancellation ownership and rollback.
+4. Multiple users competing for the last seat.
+5. Search, pagination, sorting and invalid query values.
 
-The relationship test deliberately causes a foreign-key failure after an insertion in a transaction and verifies that the insertion was rolled back. The pagination test checks actual returned titles and page boundaries. These prove business rules rather than just server availability.
+For the last-seat test, eight users try to register for an event with capacity one. `ThreadPoolExecutor` runs the callers, and `threading.Barrier` waits until all are ready before releasing them together.
 
-## 10. Python syntax you should recognize
+Each caller uses a separate test client, and the routes open separate database connections. The expected result is one 201 response, seven 409 responses and exactly one registration in the database.
 
-| Syntax | Meaning in this project |
+The refresh test uses the same idea with two requests sharing one refresh token. Exactly one gets a new token pair.
+
+The rollback test inserts an event, then deliberately causes a foreign-key failure in the same transaction. It checks that the earlier insert was undone. The pagination test checks the actual returned titles and page boundaries.
+
+## 10. Python syntax notes
+
+| Syntax | What it does in this project |
 | --- | --- |
-| `def` / `return` | Define a function / send back its result |
-| `@app.post(...)` | Register a function as an HTTP route |
-| `class ... (BaseModel)` | Declare the shape and rules of a request body |
-| `Depends(...)` | Ask FastAPI to run a prerequisite function |
-| `with` | Use a resource and reliably clean it up |
-| `try / except / finally` | Attempt work, handle errors, always clean up |
-| `raise HTTPException(...)` | Stop the request and send an error response |
-| `?` in SQL | A placeholder for safely supplied data |
-| `fetchone()` / `fetchall()` | Read one matching row / all matching rows |
-| `if __name__ == "__main__"` | Run the command only when that module is executed directly |
+| `def` / `return` | Defines a function / returns its result |
+| `@app.post(...)` | Connects a function to an HTTP route |
+| `BaseModel` | Defines the expected request body |
+| `Depends(...)` | Runs a shared check before the route |
+| `with` | Handles setup and cleanup around a block |
+| `yield` in `connect()` | Passes the connection into the block |
+| `try / except / finally` | Handles failures and cleanup |
+| `raise HTTPException(...)` | Stops a request with an error response |
+| `fetchone()` / `fetchall()` | Reads one row / all matching rows |
+| `if __name__ == "__main__"` | Runs the admin command when the module is executed directly |
 
-Routes use normal `def` because SQLite operations are synchronous. FastAPI runs these handlers in a worker thread pool. The startup `lifespan` is an async context manager because that is FastAPI's startup/shutdown interface; the business logic does not require learning async programming first.
+The routes use normal `def` because the SQLite operations are synchronous. FastAPI runs these handlers in its worker thread pool. The startup `lifespan` function uses an async context manager to initialize the database when the app starts.
 
-## 11. Practice before the interview
+## 11. My interview checklist
 
-1. Run the app, create an admin, and complete the README's demo yourself.
-2. Explain the users/events/registrations example without reading.
-3. Trace one registration from token checking to transaction commit.
-4. Explain 401 versus 403, access versus refresh, and commit versus rollback.
-5. Run the tests and describe what the concurrency test proves.
-6. Make a small change yourself: change an error message or add a new allowed sort option, then verify it.
+Before the interview, I want to be able to:
 
-If they ask whether you used AI, answer honestly: you used it to help implement the project, then studied the design, ran the tests, and practiced the flows. Be ready to point to the exact code for each claim. Reading this guide once is preparation; being able to modify and explain the code is the real check.
+- Run the app and demonstrate an admin and a member account.
+- Explain how the three main tables are related.
+- Trace a registration from the incoming request to the database commit.
+- Explain access versus refresh tokens and 401 versus 403.
+- Show why reading the seat count before taking the lock would be unsafe.
+- Explain what each test checks, especially the concurrent booking test.
+- Make a small change, such as adding a sort option, and check that it works.
+
+The main files for these points are `schema.sql`, `db.py`, `auth.py`, `main.py` and `test_api.py`.
 
 ## References
 
-- [SQLite transactions and BEGIN IMMEDIATE](https://sqlite.org/lang_transaction.html)
+- [SQLite transactions](https://sqlite.org/lang_transaction.html)
 - [FastAPI dependencies](https://fastapi.tiangolo.com/tutorial/dependencies/)
-- [Python scrypt documentation](https://docs.python.org/3/library/hashlib.html#hashlib.scrypt)
+- [Python scrypt](https://docs.python.org/3/library/hashlib.html#hashlib.scrypt)
 - [FastAPI testing](https://fastapi.tiangolo.com/tutorial/testing/)
