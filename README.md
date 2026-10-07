@@ -191,7 +191,7 @@ tests/
   test_api.py      The five integration tests
 ```
 
-I put a more detailed explanation of the logic in [my project notes](INTERVIEW_GUIDE.md).
+I put a more detailed explanation of the logic in [my project notes](NOTES.md).
 
 ## What I would improve next
 
